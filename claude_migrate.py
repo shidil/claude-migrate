@@ -681,7 +681,7 @@ def cmd_inspect(args) -> int:
     return 0
 
 
-def _parse_maps(items: list[str], src_home: str) -> dict[str, str]:
+def _parse_maps(items: list[str], src_home: str, target_home: str) -> dict[str, str]:
     out = {}
     for item in items or []:
         if "=" not in item:
@@ -689,6 +689,9 @@ def _parse_maps(items: list[str], src_home: str) -> dict[str, str]:
         old, new = item.split("=", 1)
         if old.startswith("~"):
             old = src_home + old[1:]  # ~ on the left means the *source* home
+        elif src_home != target_home and (old == target_home or old.startswith(target_home + "/")):
+            # an unquoted ~/x was expanded by the shell to this machine's home
+            old = src_home + old[len(target_home):]
         new = os.path.expanduser(new)
         if not (old.startswith("/") and new.startswith("/")) or _norm(old) == "/":
             raise SystemExit(f"error: --map paths must be absolute and not '/': {item!r}")
@@ -718,7 +721,7 @@ def cmd_import(args) -> int:
     auto = Rewriter(path_map)
     if auto.map_path(src["claude_dir"]) != str(claude_root):
         path_map[src["claude_dir"]] = str(claude_root)
-    path_map.update(_parse_maps(args.map, src["home"]))
+    path_map.update(_parse_maps(args.map, src["home"], target_home))
     paths = Rewriter(path_map)
 
     slug_map, plan = {}, []

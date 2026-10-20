@@ -71,6 +71,14 @@ class RewriterTest(unittest.TestCase):
         self.assertEqual(rw.text("projects/-Users-a-proj-rpc/", False), "projects/-Users-a-proj-rpc/")
 
 
+class ParseMapsTest(unittest.TestCase):
+    def test_tilde_means_source_home_even_when_shell_expanded(self):
+        expected = {"/Users/a/lab": "/home/b/code"}
+        self.assertEqual(cm._parse_maps(["~/lab=/home/b/code"], "/Users/a", "/home/b"), expected)
+        self.assertEqual(cm._parse_maps(["/home/b/lab=/home/b/code"], "/Users/a", "/home/b"), expected)
+        self.assertEqual(cm._parse_maps(["/opt/x=/usr/x"], "/Users/a", "/home/b"), {"/opt/x": "/usr/x"})
+
+
 class MergeConfigTest(unittest.TestCase):
     def test_target_wins_and_sources_fill_in(self):
         dst = {"userID": "t", "projects": {"/p": {"trust": True, "allowedTools": ["x"]}},
