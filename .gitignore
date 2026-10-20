@@ -1,0 +1,8 @@
+# Exported archives contain transcripts and may contain API keys
+*.tar.gz
+*.tgz
+claude-state-*
+
+__pycache__/
+*.pyc
+.DS_Store

@@ -27,6 +27,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import socket
 import sys
@@ -69,6 +70,27 @@ CLAUDE_JSON_DROP = {
 CLAUDE_JSON_MERGE = {"projects", "mcpServers", "githubRepoPaths", "skillUsage", "pluginUsage"}
 
 MAX_SLUG = 200
+
+# Well-known credential formats, replaced by --redact wherever they appear in text.
+# Scanned one by one: each starts with a literal, which re finds far faster than an alternation.
+_SECRET_RES = [(name, re.compile(pat, re.DOTALL)) for name, pat in [
+    ("anthropic", r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    ("openai", r"sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{32,}"),
+    ("github", r"gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}"),
+    ("aws", r"(?:AKIA|ASIA)[0-9A-Z]{16}"),
+    ("slack", r"xox[abposr]-[A-Za-z0-9-]{10,}"),
+    ("google", r"AIza[0-9A-Za-z_-]{35}"),
+    ("stripe", r"[rs]k_live_[0-9A-Za-z]{20,}"),
+    ("jwt", r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    ("private_key", r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----"),
+    ("bearer", r"(?<=Bearer )[A-Za-z0-9._~+/=-]{20,}"),
+]]
+_TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_-")
+# Credentials passed as URL query parameters, e.g. https://mcp.example.com/?apiKey=...
+_SECRET_PARAM_RE = re.compile(r"([?&][A-Za-z_-]*(?:api[_-]?key|token|secret)[A-Za-z_-]*=)([^&\"'\s\\]{8,})",
+                              re.IGNORECASE)
+# env/header names whose values are redacted whatever they look like.
+_SECRET_NAME_RE = re.compile(r"key|token|secret|passw|auth|credential|cookie", re.IGNORECASE)
 
 
 # --------------------------------------------------------------------------- paths
@@ -176,6 +198,70 @@ class Rewriter:
 
 def should_rewrite(rel: str) -> bool:
     return not rel.startswith(NO_REWRITE_PREFIXES) and PurePosixPath(rel).suffix in TEXT_SUFFIXES
+
+
+class Redactor:
+    """Best-effort removal of credentials from exported state (--redact).
+
+    Replaces values of secret-looking env vars and headers in settings and MCP
+    server configs, plus well-known token formats anywhere in text files.
+    """
+
+    def __init__(self):
+        self.counts = Counter()
+
+    def text(self, s: str) -> str:
+        def fmt(name):
+            def sub(m):
+                t, i, j = m.string, m.start(), m.end()
+                # a token inside a longer base64 blob is not a token (a JSON \n escape may precede one)
+                inside = ((i and t[i - 1] in _TOKEN_CHARS and not (i >= 2 and t[i - 2] == "\\" and t[i - 1] in "nrt"))
+                          or (j < len(t) and t[j] in _TOKEN_CHARS))
+                if inside and name not in ("private_key", "bearer"):
+                    return m.group(0)
+                self.counts[name] += 1
+                return f"[REDACTED:{name}]"
+            return sub
+
+        def param(m):
+            self.counts["url-param"] += 1
+            return m.group(1) + "[REDACTED]"
+        for name, pattern in _SECRET_RES:
+            s = pattern.sub(fmt(name), s)
+        return _SECRET_PARAM_RE.sub(param, s)
+
+    def _values(self, d) -> None:
+        for k, v in (d.items() if isinstance(d, dict) else []):
+            if isinstance(v, str) and _SECRET_NAME_RE.search(k) and not v.startswith("[REDACTED"):
+                d[k] = "[REDACTED]"
+                self.counts["env/header"] += 1
+
+    def config(self, config: dict) -> dict:
+        """Redact a ~/.claude.json, including per-project MCP servers."""
+        scopes = [config] + [p for p in (config.get("projects") or {}).values() if isinstance(p, dict)]
+        for scope in scopes:
+            for server in (scope.get("mcpServers") or {}).values():
+                if isinstance(server, dict):
+                    self._values(server.get("env"))
+                    self._values(server.get("headers"))
+        return json.loads(self.text(json.dumps(config)))
+
+    def bytes(self, rel: str, data: bytes) -> bytes:
+        if rel.startswith(("plugins/cache/", "plugins/marketplaces/")):
+            return data
+        try:
+            s = orig = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
+        if rel == "settings.json":
+            try:
+                settings = json.loads(s)
+                self._values(settings.get("env"))
+                s = json.dumps(settings, indent=2) + "\n"
+            except (ValueError, AttributeError):
+                pass
+        out = self.text(s)
+        return data if out == orig else out.encode("utf-8")
 
 
 def slug_fallback(slug: str, rw: Rewriter) -> str:
@@ -320,6 +406,43 @@ def merge_config(dst: dict, src: dict, overwrite: bool) -> list[str]:
     return added
 
 
+_SHELL_BUILTINS = {"cd", "export", "source", ".", "exec", "eval", "test", "[", "echo", "true", "false"}
+
+
+def missing_commands(settings: dict, config: dict) -> list[tuple[str, str]]:
+    """Programs named by hooks, the status line and MCP servers that this machine lacks."""
+    found = []
+
+    def check(where: str, cmd) -> None:
+        if not isinstance(cmd, str) or not cmd.strip():
+            return
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            tokens = cmd.split()
+        tokens = [t for t in tokens if "=" not in t.split("/")[0]]  # skip FOO=bar prefixes
+        if not tokens or "$" in tokens[0] or tokens[0] in _SHELL_BUILTINS:
+            return
+        prog = os.path.expanduser(tokens[0])
+        if not (Path(prog).exists() if "/" in prog else shutil.which(prog)):
+            found.append((where, prog))
+
+    for event, groups in (settings.get("hooks") or {}).items():
+        for group in groups if isinstance(groups, list) else []:
+            for hook in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                if isinstance(hook, dict) and hook.get("type", "command") == "command":
+                    check(f"hook {event}", hook.get("command"))
+    if isinstance(settings.get("statusLine"), dict):
+        check("statusLine", settings["statusLine"].get("command"))
+    scopes = [("", config)] + [(f" ({path})", p) for path, p in (config.get("projects") or {}).items()
+                               if isinstance(p, dict)]
+    for label, scope in scopes:
+        for name, server in (scope.get("mcpServers") or {}).items():
+            if isinstance(server, dict):
+                check(f"MCP server {name}{label}", server.get("command"))
+    return list(dict.fromkeys(found))
+
+
 def merge_history(existing: bytes, incoming: bytes) -> bytes:
     lines = list(dict.fromkeys(
         ln for ln in (existing + b"\n" + incoming).decode("utf-8", "replace").splitlines() if ln.strip()
@@ -349,6 +472,18 @@ def cmd_export(args) -> int:
 
     log(f"Resolving project paths in {claude_dir / 'projects'} ...")
     projects = resolve_projects(claude_dir, config)
+    keep = None
+    if args.project:
+        roots = [_norm(os.path.abspath(os.path.expanduser(p))) for p in args.project]
+        projects = [p for p in projects if _selected(p, roots)]
+        if not projects:
+            log(f"error: no sessions found for {', '.join(roots)}")
+            return 1
+        keep = ProjectFilter(claude_dir, projects, roots)
+        config = _filter_config(config, roots)
+    redactor = Redactor() if args.redact else None
+    if redactor:
+        config = redactor.config(config)
     manifest = {
         "format": FORMAT_VERSION,
         "created": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -361,10 +496,11 @@ def cmd_export(args) -> int:
             "config_file": str(config_file),
         },
         "projects": projects,
+        "redacted": bool(redactor),
     }
 
     skipped = []
-    files = list(collect_files(claude_dir, args, skipped))
+    files = list(collect_files(claude_dir, args, skipped, keep))
 
     out.parent.mkdir(parents=True, exist_ok=True)
     total = 0
@@ -378,8 +514,17 @@ def cmd_export(args) -> int:
                 info = tar.gettarinfo(str(f), arcname=f"claude/{rel}")
                 if info.islnk():  # store hard links as plain copies
                     info.type, info.linkname, info.size = tarfile.REGTYPE, "", f.stat().st_size
-                with f.open("rb") as src:
-                    tar.addfile(info, src)
+                data = None
+                if keep and rel == "history.jsonl":
+                    data = keep.history(f.read_bytes())
+                if redactor:
+                    data = redactor.bytes(rel, f.read_bytes() if data is None else data)
+                if data is None:
+                    with f.open("rb") as src:
+                        tar.addfile(info, src)
+                else:
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
                 total += info.size
             except (OSError, tarfile.TarError) as e:
                 log(f"  warning: skipped {rel}: {e}")
@@ -392,19 +537,86 @@ def cmd_export(args) -> int:
         log(f"  {len(unresolved)} project dir(s) have no recoverable path; they are remapped by prefix on import:")
         for p in unresolved:
             log(f"    {p['slug']}")
-    log("\nThe archive holds every transcript and any API keys in MCP/settings env. Keep it private.")
+    if redactor:
+        found = ", ".join(f"{n} {k}" for k, n in sorted(redactor.counts.items())) or "nothing"
+        log(f"  redacted: {found}")
+        log("\nRedaction is pattern-based and best-effort. The archive still holds every transcript. "
+            "Keep it private.")
+    else:
+        log("\nThe archive holds every transcript and any API keys in MCP/settings env. Keep it private "
+            "(or re-export with --redact).")
     _warn_cleanup(load_json(claude_dir / "settings.json", {}), "this machine",
                   fix="set it in ~/.claude/settings.json now so nothing is pruned before you migrate.")
     return 0
 
 
-def collect_files(claude_dir: Path, args, skipped: list[str]):
+def _under(path: str, roots: list[str]) -> bool:
+    return any(path == r or path.startswith(r.rstrip("/") + "/") for r in roots)
+
+
+def _selected(project: dict, roots: list[str]) -> bool:
+    if project["cwd"]:
+        return _under(project["cwd"], roots)
+    return any(project["slug"] == slugify(r) or project["slug"].startswith(slugify(r) + "-") for r in roots)
+
+
+class ProjectFilter:
+    """Limits an export to some projects: their session dirs, the per-session
+    state keyed by session id, and their history.jsonl lines."""
+
+    PER_SESSION = ("file-history", "tasks", "todos")
+
+    def __init__(self, claude_dir: Path, projects: list[dict], roots: list[str]):
+        self.roots = roots
+        self.slugs = {p["slug"] for p in projects}
+        self.sessions = set()
+        for slug in self.slugs:
+            for entry in (claude_dir / "projects" / slug).iterdir():
+                self.sessions.add(entry.name[:-6] if entry.name.endswith(".jsonl") else entry.name)
+
+    def __call__(self, rel: str) -> bool:
+        parts = rel.split("/")
+        if len(parts) < 2:
+            return True
+        if parts[0] == "projects":
+            return parts[1] in self.slugs
+        if parts[0] in self.PER_SESSION:
+            return parts[1].split("-agent-")[0] in self.sessions  # todos: <session>-agent-<id>.json
+        return True
+
+    def history(self, data: bytes) -> bytes:
+        out = []
+        for ln in data.decode("utf-8", "replace").splitlines():
+            try:
+                project = json.loads(ln).get("project")
+            except (ValueError, AttributeError):
+                continue
+            if isinstance(project, str) and _under(project, self.roots):
+                out.append(ln + "\n")
+        return "".join(out).encode("utf-8")
+
+
+def _filter_config(config: dict, roots: list[str]) -> dict:
+    config = dict(config)
+    config["projects"] = {k: v for k, v in (config.get("projects") or {}).items() if _under(k, roots)}
+    repos = {}
+    for repo, paths in (config.get("githubRepoPaths") or {}).items():
+        kept = [p for p in paths if isinstance(p, str) and _under(p, roots)]
+        if kept:
+            repos[repo] = kept
+    config["githubRepoPaths"] = repos
+    return config
+
+
+def collect_files(claude_dir: Path, args, skipped: list[str], keep=None):
     """Yield (path on disk, path in archive) for everything to export.
 
     Symlinks are stored as the content they point to: links into e.g. ~/.agents
     (where some skill installers put skills) would dangle on the new machine.
     """
     def visit(path: Path, rel: str, stack: frozenset):
+        if keep and not keep(rel):
+            return
         if path.is_symlink():
             if not path.exists():
                 log(f"  warning: broken symlink skipped: {rel}")
@@ -540,6 +752,7 @@ def cmd_import(args) -> int:
     now = time.time()
     backup_dir = claude_dir / "backups" / f"migrate-{dt.datetime.now():%Y%m%d-%H%M%S}"
     imported_config = b"{}"
+    incoming_settings = {}
 
     for m in tar:
         name = m.name
@@ -563,6 +776,8 @@ def cmd_import(args) -> int:
             continue
 
         data = rw.bytes(rel, tar.extractfile(m).read())
+        if rel == "settings.json":
+            incoming_settings = json.loads(data.decode("utf-8") or "{}")
         if rel.endswith(".jsonl") and parts[0] == "projects":
             age = (now - m.mtime) / 86400
             oldest = age if oldest is None else max(oldest, age)
@@ -623,6 +838,15 @@ def cmd_import(args) -> int:
             log(f"  ... and {len(conflicts) - 10} more")
     if stats["overwritten"] and not dry:
         log(f"Replaced files were moved to {backup_dir}")
+    missing = missing_commands(incoming_settings, incoming)
+    if missing:
+        log("\nThese commands from the imported hooks, status line or MCP servers were not found here:")
+        for where, cmd in missing:
+            log(f"  {where}: {cmd}")
+        log("  Install them, or fix the paths (re-run with --map OLD=NEW if they only moved).")
+    if manifest.get("redacted"):
+        log("\nThis archive was exported with --redact: re-enter the API keys and tokens marked [REDACTED] "
+            "in ~/.claude/settings.json and your MCP server config.")
     if args.cleanup_days is None:
         _warn_cleanup(settings, "this machine", oldest)
     if dry:
@@ -705,6 +929,11 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("export", help="write Claude Code state to an archive")
     p.add_argument("-o", "--output", help="archive path (default: ./claude-state-<host>-<time>.tar.gz)")
+    p.add_argument("--project", action="append", metavar="PATH",
+                   help="only export sessions for projects at or under PATH (repeatable); "
+                        "settings, skills and plugins are still included")
+    p.add_argument("--redact", action="store_true",
+                   help="replace API keys, tokens and secret env values with [REDACTED] (best-effort)")
     p.add_argument("--include-jobs", action="store_true", help="also export ~/.claude/jobs (can be large)")
     p.add_argument("--exclude", action="append", metavar="GLOB",
                    help="extra top-level entry of ~/.claude to skip (repeatable)")

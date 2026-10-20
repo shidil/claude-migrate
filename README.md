@@ -7,6 +7,11 @@ differ.
 
 One file, Python 3.8+ standard library only.
 
+> **Status:** tested on macOS with Claude Code 2.1.30x, including a restore into a
+> Linux-style `/home/<user>` layout. Not yet tested on a real Linux machine, and
+> Windows is not supported. The tool depends on Claude Code's undocumented on-disk
+> format, so a future release could break it. `import --dry-run` first.
+
 ## Usage
 
 On the old machine:
@@ -40,6 +45,38 @@ left means the *old* home):
 The dry run marks each project `ok` (the path exists here) or `--` (it doesn't).
 Sessions for `--` projects are still restored; they show up in `--resume` once the
 repo is at that path.
+
+After importing, the tool lists hooks, the status line and MCP servers whose
+commands don't exist on the new machine, such as a hook that calls
+`/opt/homebrew/bin/...` after a Mac → Linux move.
+
+### Only some projects
+
+```sh
+./claude_migrate.py export --project ~/projects/my-app -o my-app.tar.gz
+```
+
+`--project` (repeatable) exports only the sessions, memory, history and per-session
+state of projects at or under that path. Settings, skills and plugins are still
+included.
+
+### Sharing an archive, or storing it somewhere less private
+
+```sh
+./claude_migrate.py export --redact -o claude-state.tar.gz
+```
+
+`--redact` replaces credentials with `[REDACTED]`:
+
+- values of env vars and headers with names like `*KEY*`, `*TOKEN*`, `*SECRET*` or
+  `Authorization`, in `settings.json` and MCP server configs
+- API keys in URL query parameters (`?apiKey=...`)
+- well-known token formats anywhere in text: Anthropic, OpenAI, GitHub, AWS, Slack,
+  Google, Stripe, JWTs, private keys and `Bearer` tokens
+
+It is pattern-based and best-effort. Credentials in other formats stay in the
+transcripts, so still treat the archive as private. You'll need to re-enter the
+redacted values after importing.
 
 ### Moving a project later, on the same machine
 
@@ -110,7 +147,9 @@ removed.
   `--cleanup-days N` (or set it yourself) before you first run `claude`. Also set it
   on the old machine, so nothing is deleted before you export.
 - The archive is created with mode `600`. It contains every transcript, and any API
-  keys in MCP server configs or `settings.json` `env`. Treat it like a password file.
+  keys in MCP server configs or `settings.json` `env` (unless you use `--redact`).
+  Treat it like a password file. The included `.gitignore` keeps `*.tar.gz` out of
+  git.
 
 ## Not migrated
 
@@ -124,6 +163,10 @@ removed.
 ```sh
 python3 -m unittest -v test_claude_migrate
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ## Credits
 

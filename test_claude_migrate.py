@@ -110,6 +110,19 @@ class RoundTripTest(unittest.TestCase):
         self.assertEqual(code, 0, err.getvalue())
         return err.getvalue()
 
+    def export(self, *extra):
+        sh = str(self.src_home)
+        home = os.environ.get("HOME")
+        os.environ["HOME"] = sh  # export records $HOME as the source home
+        try:
+            out = self.run_cli("export", "-o", self.archive, "--claude-dir", f"{sh}/.claude",
+                               "--config-file", f"{sh}/.claude.json", *extra)
+        finally:
+            os.environ["HOME"] = home
+        with tarfile.open(self.archive) as tar:
+            files = {m.name: tar.extractfile(m).read().decode() for m in tar if m.isfile()}
+        return out, files
+
     def write_source(self):
         h = str(self.src_home)
         cd = self.src_home / ".claude"
@@ -145,16 +158,9 @@ class RoundTripTest(unittest.TestCase):
 
     def test_export_import_reimport_remap(self):
         sh, dh = str(self.src_home), str(self.dst_home)
-        home = os.environ.get("HOME")
-        os.environ["HOME"] = sh  # export records $HOME as the source home
-        try:
-            self.run_cli("export", "-o", self.archive, "--claude-dir", f"{sh}/.claude",
-                         "--config-file", f"{sh}/.claude.json")
-        finally:
-            os.environ["HOME"] = home
-        with tarfile.open(self.archive) as tar:
-            names = tar.getnames()
-            manifest_projects = json.load(tar.extractfile("manifest.json"))["projects"]
+        _, files = self.export()
+        names = list(files)
+        manifest_projects = json.loads(files["manifest.json"])["projects"]
         self.assertEqual(manifest_projects[0]["cwd"], f"{sh}/lab/app.rpc")
         self.assertIn("claude/skills/find/SKILL.md", names)
         self.assertFalse(any(n.startswith(("claude/debug", "claude/sessions")) for n in names))
@@ -205,6 +211,96 @@ class RoundTripTest(unittest.TestCase):
         moved_dir = cd / "projects" / cm.slugify(moved)
         self.assertEqual(json.loads((moved_dir / "s1.jsonl").read_text().splitlines()[0])["cwd"], moved)
         self.assertIn(moved, json.loads((self.dst_home / ".claude.json").read_text())["projects"])
+
+    def test_export_single_project(self):
+        sh = str(self.src_home)
+        cd = self.src_home / ".claude"
+        other = f"{sh}/lab/other"
+        (cd / "projects" / cm.slugify(other)).mkdir()
+        (cd / "projects" / cm.slugify(other) / "s2.jsonl").write_text(line(cwd=other))
+        (cd / "file-history" / "s2").mkdir()
+        (cd / "todos").mkdir()
+        (cd / "todos" / "s1-agent-s1.json").write_text("[]")
+        (cd / "todos" / "s2-agent-s2.json").write_text("[]")
+        with (cd / "history.jsonl").open("a") as f:
+            f.write(line(display="other", timestamp=3, project=other))
+        cfg = json.loads((self.src_home / ".claude.json").read_text())
+        cfg["projects"][other] = {}
+        (self.src_home / ".claude.json").write_text(json.dumps(cfg))
+
+        _, files = self.export("--project", f"{sh}/lab/app.rpc")
+        names = set(files)
+        self.assertIn(f"claude/projects/{cm.slugify(sh + '/lab/app.rpc')}/s1.jsonl", names)
+        self.assertFalse(any(cm.slugify(other) in n for n in names))
+        self.assertIn("claude/todos/s1-agent-s1.json", names)
+        self.assertNotIn("claude/todos/s2-agent-s2.json", names)
+        self.assertNotIn("claude/file-history/s2", " ".join(names))
+        self.assertIn("claude/settings.json", names)
+        self.assertNotIn("other", files["claude/history.jsonl"])
+        self.assertEqual(list(json.loads(files["claude.json"])["projects"]), [f"{sh}/lab/app.rpc"])
+        self.assertEqual(len(json.loads(files["manifest.json"])["projects"]), 1)
+
+    def test_export_redact(self):
+        cd = self.src_home / ".claude"
+        key = "sk-ant-" + "api03-" + "x" * 40
+        with (cd / "projects" / cm.slugify(f"{self.src_home}/lab/app.rpc") / "s1.jsonl").open("a") as f:
+            f.write(line(type="user", message={"content": f"export ANTHROPIC_API_KEY={key}"}))
+        (cd / "settings.json").write_text(json.dumps({"env": {"MY_TOKEN": "plain-value", "EDITOR": "vim"}}))
+        cfg = json.loads((self.src_home / ".claude.json").read_text())
+        cfg["mcpServers"]["exa"] = {"type": "http", "url": "https://mcp.example.com/mcp?exaApiKey=abcdef123456",
+                                    "headers": {"Authorization": "Bearer abc"}, "env": {"LOG_LEVEL": "debug"}}
+        (self.src_home / ".claude.json").write_text(json.dumps(cfg))
+
+        out, files = self.export("--redact")
+        self.assertIn("redacted:", out)
+        joined = "\n".join(files.values())
+        self.assertNotIn(key, joined)
+        self.assertIn("[REDACTED:anthropic]", joined)
+        settings = json.loads(files["claude/settings.json"])
+        self.assertEqual(settings["env"], {"MY_TOKEN": "[REDACTED]", "EDITOR": "vim"})
+        exa = json.loads(files["claude.json"])["mcpServers"]["exa"]
+        self.assertEqual(exa["url"], "https://mcp.example.com/mcp?exaApiKey=[REDACTED]")
+        self.assertEqual(exa["headers"]["Authorization"], "[REDACTED]")
+        self.assertEqual(exa["env"]["LOG_LEVEL"], "debug")
+        self.assertTrue(json.loads(files["manifest.json"])["redacted"])
+
+
+class RedactorTest(unittest.TestCase):
+    def test_formats(self):
+        r = cm.Redactor()
+        gh = "ghp_" + "A" * 36
+        pem = "-----BEGIN RSA PRIVATE KEY-----\\nMIIE\\n-----END RSA PRIVATE KEY-----"
+        out = r.text(f'"token {gh} and {pem} done"')
+        self.assertEqual(out, '"token [REDACTED:github] and [REDACTED:private_key] done"')
+        self.assertEqual(r.text("sk-ant-short"), "sk-ant-short")
+
+    def test_tokens_inside_base64_are_left_alone(self):
+        r = cm.Redactor()
+        google = "AIza" + "B" * 35
+        self.assertEqual(r.text(f"QqzQW8fznW{google}Zl2nm8W"), f"QqzQW8fznW{google}Zl2nm8W")
+        self.assertEqual(r.text(f'"key":"{google}"'), '"key":"[REDACTED:google]"')
+        self.assertEqual(r.text(f"x\\n{google}"), "x\\n[REDACTED:google]")
+
+
+class MissingCommandsTest(unittest.TestCase):
+    def test_reports_only_missing_programs(self):
+        settings = {
+            "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [
+                {"type": "command", "command": "/opt/nope/bin/lint --fix"},
+                {"type": "command", "command": "FOO=1 python3 -c pass"},
+                {"type": "command", "command": "cd /tmp && ls"},
+                {"type": "command", "command": "$CLAUDE_PROJECT_DIR/hook.sh"},
+            ]}]},
+            "statusLine": {"type": "command", "command": "~/.nope/statusline.sh"},
+        }
+        config = {"mcpServers": {"a": {"command": "no-such-binary-xyz"}, "b": {"type": "http", "url": "x"}},
+                  "projects": {"/p": {"mcpServers": {"c": {"command": "/bin/sh"}}}}}
+        found = cm.missing_commands(settings, config)
+        self.assertEqual(found, [
+            ("hook PreToolUse", "/opt/nope/bin/lint"),
+            ("statusLine", os.path.expanduser("~/.nope/statusline.sh")),
+            ("MCP server a", "no-such-binary-xyz"),
+        ])
 
 
 if __name__ == "__main__":
